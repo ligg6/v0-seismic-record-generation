@@ -1,8 +1,8 @@
 "use client"
 
-import { Input } from "@/components/ui/input"
 import { Button } from "@/components/ui/button"
 import { Trash2 } from "lucide-react"
+import { NumberField } from "@/components/number-field"
 import type { Layer } from "@/components/synthetic-seismogram"
 
 interface LayerModelProps {
@@ -22,35 +22,43 @@ export function LayerModel({ layers, onUpdate, onRemove }: LayerModelProps) {
       </div>
       {layers.map((layer, index) => (
         <div key={layer.id} className="grid grid-cols-4 gap-2 items-center">
-          <Input
-            type="number"
+          <NumberField
             value={layer.velocity}
-            onChange={(e) => onUpdate(layer.id, { velocity: Number(e.target.value) })}
+            onCommit={(v) => onUpdate(layer.id, { velocity: v })}
             min={500}
             max={8000}
+            aria-label={`层 ${index + 1} 速度`}
             className="h-8 text-sm"
           />
-          <Input
-            type="number"
+          <NumberField
             value={layer.density}
-            onChange={(e) => onUpdate(layer.id, { density: Number(e.target.value) })}
+            onCommit={(v) => onUpdate(layer.id, { density: v })}
             min={1000}
             max={4000}
+            aria-label={`层 ${index + 1} 密度`}
             className="h-8 text-sm"
           />
-          <Input
-            type="number"
-            value={layer.thickness}
-            onChange={(e) => onUpdate(layer.id, { thickness: Number(e.target.value) })}
-            min={10}
-            max={1000}
-            className="h-8 text-sm"
-          />
+          {index === layers.length - 1 ? (
+            // 最底层是半空间：没有下界面，厚度不参与计算
+            <span className="text-xs text-muted-foreground px-2" title="最底层为半空间，厚度不参与计算">
+              半空间
+            </span>
+          ) : (
+            <NumberField
+              value={layer.thickness}
+              onCommit={(v) => onUpdate(layer.id, { thickness: v })}
+              min={1}
+              max={1000}
+              aria-label={`层 ${index + 1} 厚度`}
+              className="h-8 text-sm"
+            />
+          )}
           <Button
             size="icon"
             variant="ghost"
             onClick={() => onRemove(layer.id)}
             disabled={layers.length <= 2}
+            aria-label={`删除层 ${index + 1}`}
             className="h-8 w-8"
           >
             <Trash2 className="h-4 w-4" />

@@ -3,11 +3,15 @@
 import { useMemo } from "react"
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
 import { Check, X } from "lucide-react"
+import { maxAbsOf } from "@/lib/seismic-utils"
 
 interface ValidationPanelProps {
   wavelet: number[]
   syntheticTrace: number[]
   reflectionSeries: number[]
+  waveletSpectrum: { frequencies: number[]; amplitudes: number[] }
+  /** 记录时长内各界面的双程时 (s) */
+  interfaceTimes: number[]
   frequency: number
   sampleRate: number
 }
@@ -16,80 +20,86 @@ export function ValidationPanel({
   wavelet,
   syntheticTrace,
   reflectionSeries,
+  waveletSpectrum,
+  interfaceTimes,
   frequency,
   sampleRate,
 }: ValidationPanelProps) {
   const validations = useMemo(() => {
-    // 1. Check wavelet is zero-phase (symmetric)
-    const midIndex = Math.floor(wavelet.length / 2)
-    let symmetryError = 0
-    for (let i = 0; i < midIndex; i++) {
-      symmetryError += Math.abs(wavelet[midIndex - i] - wavelet[midIndex + i])
-    }
-    const isSymmetric = symmetryError / midIndex < 0.01
+    const waveletPeak = maxAbsOf(wavelet) || 1
 
-    // 2. Check wavelet peak is at center
-    const maxIndex = wavelet.indexOf(Math.max(...wavelet))
-    const peakAtCenter = Math.abs(maxIndex - midIndex) <= 1
+    // 1. 子波窗口是否足够长：窗口边缘振幅应可忽略，否则截断会给频谱引入直流分量
+    const edgeRatio = Math.max(Math.abs(wavelet[0]), Math.abs(wavelet[wavelet.length - 1])) / waveletPeak
+    const notTruncated = edgeRatio < 0.01
 
-    // 3. Check convolution length
-    const expectedLength = reflectionSeries.length + wavelet.length - 1
-    const correctConvLength = syntheticTrace.length === expectedLength
+    // 2. 实测子波频谱峰值应等于设定主频（Ricker 子波振幅谱峰值即主频）
+    const { frequencies, amplitudes } = waveletSpectrum
+    let peakIndex = 1
+    for (let k = 1; k < amplitudes.length; k++) if (amplitudes[k] > amplitudes[peakIndex]) peakIndex = k
+    const peakFrequency = frequencies[peakIndex] ?? 0
+    const df = frequencies[1] ?? 0
+    const peakMatches = Math.abs(peakFrequency - frequency) <= Math.max(0.05 * frequency, df)
 
-    // 4. Check energy preservation (rough estimate)
-    const waveletEnergy = wavelet.reduce((sum, v) => sum + v * v, 0)
-    const refEnergy = reflectionSeries.reduce((sum, v) => sum + v * v, 0)
-    const traceEnergy = syntheticTrace.reduce((sum, v) => sum + v * v, 0)
-    const expectedEnergy = waveletEnergy * refEnergy
-    const energyRatio = traceEnergy / (expectedEnergy || 1)
-    const energyReasonable = energyRatio > 0.1 && energyRatio < 10
-
-    // 5. Check Ricker wavelet theoretical properties
-    // Peak frequency should match dominant frequency
+    // 3. 采样是否充分：Ricker 振幅谱 A(f)/A(fm) = (f/fm)² · exp(1 − (f/fm)²)，奈奎斯特频率处应低于 5%（约需 f_N ≥ 2.5 fm）
     const nyquist = 1 / (2 * sampleRate)
-    const freqBelowNyquist = frequency < nyquist
+    const ratio = nyquist / frequency
+    const ampAtNyquist = ratio * ratio * Math.exp(1 - ratio * ratio)
+    const wellSampled = ampAtNyquist < 0.05
 
-    // 6. Check for reflections in synthetic trace
-    const hasReflections = syntheticTrace.some((v) => Math.abs(v) > 0.001)
+    // 4. 反射时间：首个界面若与下一界面相距足够远（≥ 1/fm，无调谐干涉），合成道在该处的极值应正好落在界面双程时
+    const firstTime = interfaceTimes[0]
+    let timing: { passed: boolean; detail: string }
+    if (firstTime === undefined) {
+      timing = { passed: false, detail: "记录时长内没有反射界面" }
+    } else if (interfaceTimes.length > 1 && interfaceTimes[1] - firstTime < 1 / frequency) {
+      timing = { passed: true, detail: "首个界面与下一界面间距小于 1/主频，存在调谐干涉，不比较峰值位置" }
+    } else {
+      const center = Math.round(firstTime / sampleRate)
+      const halfWindow = Math.max(1, Math.round(0.5 / frequency / sampleRate))
+      let best = center
+      for (let i = Math.max(0, center - halfWindow); i <= Math.min(syntheticTrace.length - 1, center + halfWindow); i++) {
+        if (Math.abs(syntheticTrace[i]) > Math.abs(syntheticTrace[best])) best = i
+      }
+      const offsetMs = (best - firstTime / sampleRate) * sampleRate * 1000
+      timing = {
+        passed: best === center,
+        detail: `首个界面 ${(firstTime * 1000).toFixed(1)} ms，合成道峰值 ${(best * sampleRate * 1000).toFixed(1)} ms（偏差 ${offsetMs.toFixed(1)} ms）`,
+      }
+    }
 
-    // 7. Verify minimum phase consideration
-    const maxTraceAmp = Math.max(...syntheticTrace.map(Math.abs))
-    const maxWaveletAmp = Math.max(...wavelet.map(Math.abs))
-    const amplitudePreserved = maxTraceAmp > 0 && maxWaveletAmp > 0
+    // 5. 记录中应有非零反射
+    const reflectionCount = reflectionSeries.filter((v) => v !== 0).length
+    const hasReflections = reflectionCount > 0 && maxAbsOf(syntheticTrace) > 0
 
     return [
       {
-        name: "子波对称性 (零相位)",
-        passed: isSymmetric,
-        detail: `对称误差: ${symmetryError.toFixed(4)}`,
+        name: "子波窗口完整（未截断）",
+        passed: notTruncated,
+        detail: `窗口边缘振幅为峰值的 ${(edgeRatio * 100).toFixed(3)}%（应 < 1%）`,
       },
       {
-        name: "子波峰值居中",
-        passed: peakAtCenter,
-        detail: `峰值位置偏移: ${Math.abs(maxIndex - midIndex)} 采样点`,
+        name: "子波频谱峰值与主频一致",
+        passed: peakMatches,
+        detail: `设定主频 ${frequency} Hz，实测频谱峰值 ${peakFrequency.toFixed(1)} Hz`,
       },
       {
-        name: "褶积长度正确",
-        passed: correctConvLength,
-        detail: `期望: ${expectedLength}, 实际: ${syntheticTrace.length}`,
+        name: "采样充分（奈奎斯特频率处子波能量可忽略）",
+        passed: wellSampled,
+        detail: `奈奎斯特 ${nyquist.toFixed(1)} Hz 处子波振幅为峰值的 ${(ampAtNyquist * 100).toFixed(1)}%（应 < 5%，约需 ≥ ${(2.5 * frequency).toFixed(0)} Hz）`,
       },
       {
-        name: "频率满足采样定理",
-        passed: freqBelowNyquist,
-        detail: `主频: ${frequency} Hz, 奈奎斯特: ${nyquist.toFixed(1)} Hz`,
+        name: "反射时间与模型一致",
+        ...timing,
       },
       {
         name: "合成记录包含反射",
         passed: hasReflections,
-        detail: hasReflections ? "检测到反射波形" : "未检测到有效反射",
-      },
-      {
-        name: "振幅保持合理",
-        passed: amplitudePreserved,
-        detail: `子波峰值: ${maxWaveletAmp.toFixed(4)}, 道峰值: ${maxTraceAmp.toFixed(4)}`,
+        detail: hasReflections
+          ? `记录时长内有 ${reflectionCount} 个非零反射`
+          : "没有非零反射：界面超出记录时长，或相邻层波阻抗相同",
       },
     ]
-  }, [wavelet, syntheticTrace, reflectionSeries, frequency, sampleRate])
+  }, [wavelet, syntheticTrace, reflectionSeries, waveletSpectrum, interfaceTimes, frequency, sampleRate])
 
   const passedCount = validations.filter((v) => v.passed).length
   const allPassed = passedCount === validations.length
