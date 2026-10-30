@@ -3,7 +3,6 @@
 import { useState, useMemo, useCallback } from "react"
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
 import { Button } from "@/components/ui/button"
-import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
 import { Slider } from "@/components/ui/slider"
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs"
@@ -11,8 +10,10 @@ import { LayerModel } from "@/components/layer-model"
 import { WaveformDisplay } from "@/components/waveform-display"
 import { SpectrumDisplay } from "@/components/spectrum-display"
 import { ValidationPanel } from "@/components/validation-panel"
+import { NumberField } from "@/components/number-field"
 import {
   generateRickerWavelet,
+  rickerWindowLength,
   calculateReflectionCoefficients,
   convolve,
   calculateSpectrum,
@@ -40,8 +41,8 @@ export function SyntheticSeismogram() {
   const [duration, setDuration] = useState(1.0) // seconds
 
   const seismicData = useMemo(() => {
-    // Generate Ricker wavelet
-    const wavelet = generateRickerWavelet(frequency, sampleRate, 0.2)
+    // Generate Ricker wavelet (window grows at low frequencies so it is not truncated)
+    const wavelet = generateRickerWavelet(frequency, sampleRate, rickerWindowLength(frequency))
 
     // Calculate reflection coefficients
     const { coefficients, times, depths, impedances } = calculateReflectionCoefficients(layers, sampleRate, duration)
@@ -50,15 +51,19 @@ export function SyntheticSeismogram() {
     const numSamples = Math.floor(duration / sampleRate)
     const reflectionSeries = new Array(numSamples).fill(0)
 
+    // 就近取样点；薄层导致两个界面落在同一样点时反射系数叠加，而不是互相覆盖
     times.forEach((time, i) => {
-      const sampleIndex = Math.floor(time / sampleRate)
+      const sampleIndex = Math.round(time / sampleRate)
       if (sampleIndex < numSamples) {
-        reflectionSeries[sampleIndex] = coefficients[i]
+        reflectionSeries[sampleIndex] += coefficients[i]
       }
     })
 
-    // Convolve wavelet with reflection series
-    const syntheticTrace = convolve(reflectionSeries, wavelet)
+    // Convolve wavelet with reflection series.
+    // 零相位子波的峰值在中点，完整褶积结果整体滞后半个子波：截掉前半个子波，
+    // 使合成记录与反射系数序列共用同一时间轴，反射峰对齐真实双程时
+    const halfWavelet = Math.floor(wavelet.length / 2)
+    const syntheticTrace = convolve(reflectionSeries, wavelet).slice(halfWavelet, halfWavelet + numSamples)
 
     // Calculate spectra
     const waveletSpectrum = calculateSpectrum(wavelet, sampleRate)
@@ -68,7 +73,7 @@ export function SyntheticSeismogram() {
     const timeAxis = Array.from({ length: syntheticTrace.length }, (_, i) => i * sampleRate)
     const waveletTimeAxis = Array.from(
       { length: wavelet.length },
-      (_, i) => (i - Math.floor(wavelet.length / 2)) * sampleRate,
+      (_, i) => (i - halfWavelet) * sampleRate,
     )
 
     return {
@@ -85,6 +90,10 @@ export function SyntheticSeismogram() {
       impedances,
     }
   }, [layers, frequency, sampleRate, duration])
+
+  // 频谱显示到 3 倍主频（Ricker 子波在此处振幅已不足峰值的 0.4%），不超过奈奎斯特频率
+  const spectrumMaxFrequency = Math.min(1 / (2 * sampleRate), Math.max(100, 3 * frequency))
+  const overburdenThickness = layers.slice(0, -1).reduce((sum, layer) => sum + layer.thickness, 0) || 1
 
   const handleAddLayer = useCallback(() => {
     const newId = String(Date.now())
@@ -121,24 +130,24 @@ export function SyntheticSeismogram() {
             </div>
             <div className="space-y-2">
               <Label>采样间隔 (ms)</Label>
-              <Input
-                type="number"
-                value={sampleRate * 1000}
-                onChange={(e) => setSampleRate(Number(e.target.value) / 1000)}
+              <NumberField
+                value={Math.round(sampleRate * 1e6) / 1e3}
+                onCommit={(v) => setSampleRate(v / 1000)}
                 min={0.1}
                 max={10}
                 step={0.1}
+                aria-label="采样间隔 (ms)"
               />
             </div>
             <div className="space-y-2">
               <Label>记录时长 (s)</Label>
-              <Input
-                type="number"
+              <NumberField
                 value={duration}
-                onChange={(e) => setDuration(Number(e.target.value))}
+                onCommit={setDuration}
                 min={0.5}
                 max={5}
                 step={0.1}
+                aria-label="记录时长 (s)"
               />
             </div>
           </CardContent>
@@ -197,7 +206,7 @@ export function SyntheticSeismogram() {
                 <CardContent>
                   <WaveformDisplay
                     data={seismicData.reflectionSeries}
-                    timeAxis={seismicData.timeAxis.slice(0, seismicData.reflectionSeries.length)}
+                    timeAxis={seismicData.timeAxis}
                     title="Reflection Coefficients"
                     color="#ef4444"
                     xLabel="时间 (s)"
@@ -233,7 +242,12 @@ export function SyntheticSeismogram() {
                   <CardTitle className="text-base">子波频谱</CardTitle>
                 </CardHeader>
                 <CardContent>
-                  <SpectrumDisplay spectrum={seismicData.waveletSpectrum} title="Wavelet Spectrum" color="#3b82f6" />
+                  <SpectrumDisplay
+                    spectrum={seismicData.waveletSpectrum}
+                    title="Wavelet Spectrum"
+                    color="#3b82f6"
+                    maxFrequency={spectrumMaxFrequency}
+                  />
                 </CardContent>
               </Card>
 
@@ -242,7 +256,12 @@ export function SyntheticSeismogram() {
                   <CardTitle className="text-base">合成记录频谱</CardTitle>
                 </CardHeader>
                 <CardContent>
-                  <SpectrumDisplay spectrum={seismicData.traceSpectrum} title="Trace Spectrum" color="#10b981" />
+                  <SpectrumDisplay
+                    spectrum={seismicData.traceSpectrum}
+                    title="Trace Spectrum"
+                    color="#10b981"
+                    maxFrequency={spectrumMaxFrequency}
+                  />
                 </CardContent>
               </Card>
             </div>
@@ -256,21 +275,23 @@ export function SyntheticSeismogram() {
               <CardContent>
                 <div className="grid gap-4 md:grid-cols-2">
                   <div>
-                    <h4 className="mb-2 font-medium text-sm text-muted-foreground">地层剖面</h4>
+                    <h4 className="mb-2 font-medium text-sm text-muted-foreground">地层剖面（厚度按比例）</h4>
                     <div className="space-y-1">
                       {layers.map((layer, i) => {
                         const impedance = layer.velocity * layer.density
                         const hue = 200 - layer.velocity / 50
+                        const isHalfSpace = i === layers.length - 1
                         return (
                           <div
                             key={layer.id}
                             className="flex items-center justify-between rounded px-3 py-2 text-sm text-white"
                             style={{
                               backgroundColor: `hsl(${hue}, 60%, 45%)`,
-                              height: Math.max(30, layer.thickness / 5),
+                              // 上覆各层按厚度比例分配 240px（至少 30px 以容纳文字），最底层为半空间
+                              height: isHalfSpace ? 40 : Math.max(30, (layer.thickness / overburdenThickness) * 240),
                             }}
                           >
-                            <span>层 {i + 1}</span>
+                            <span>{isHalfSpace ? "半空间" : `层 ${i + 1}`}</span>
                             <span>V={layer.velocity} m/s</span>
                             <span>Z={(impedance / 1e6).toFixed(2)} MRayl</span>
                           </div>
@@ -314,6 +335,8 @@ export function SyntheticSeismogram() {
               wavelet={seismicData.wavelet}
               syntheticTrace={seismicData.syntheticTrace}
               reflectionSeries={seismicData.reflectionSeries}
+              waveletSpectrum={seismicData.waveletSpectrum}
+              interfaceTimes={seismicData.times}
               frequency={frequency}
               sampleRate={sampleRate}
             />

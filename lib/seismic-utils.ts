@@ -1,12 +1,23 @@
 /**
+ * Ricker 子波窗口长度（秒）：至少 0.2 s，低主频时加长到 2.5/f，
+ * 保证窗口边缘振幅可忽略（|t| = 1.25/f 处约为峰值的 6e-6），避免截断引入直流分量
+ */
+export function rickerWindowLength(frequency: number): number {
+  return Math.max(0.2, 2.5 / frequency)
+}
+
+/**
  * Generate a Ricker (Mexican Hat) wavelet
  * @param frequency - Dominant frequency in Hz
  * @param dt - Sample interval in seconds
  * @param length - Wavelet length in seconds
+ * @returns 奇数个样点的零相位子波，峰值位于中点
  */
 export function generateRickerWavelet(frequency: number, dt: number, length: number): number[] {
-  const numSamples = Math.floor(length / dt)
-  const halfLength = Math.floor(numSamples / 2)
+  if (!(dt > 0) || !(length > 0) || !(frequency > 0)) {
+    throw new RangeError(`invalid wavelet parameters: f=${frequency}, dt=${dt}, length=${length}`)
+  }
+  const halfLength = Math.floor(length / dt / 2)
   const wavelet: number[] = []
 
   for (let i = -halfLength; i <= halfLength; i++) {
@@ -22,6 +33,7 @@ export function generateRickerWavelet(frequency: number, dt: number, length: num
 
 /**
  * Calculate reflection coefficients from layer model
+ * 最后一层视为半空间，其厚度不参与计算
  */
 export function calculateReflectionCoefficients(
   layers: { velocity: number; density: number; thickness: number }[],
@@ -72,49 +84,110 @@ export function calculateReflectionCoefficients(
 
 /**
  * Perform convolution of two signals
+ * 跳过 signal 中的零值样点：反射系数序列是稀疏的，计算量从 O(N·M) 降到 O(K·M)（K 为反射界面数）
  */
 export function convolve(signal: number[], kernel: number[]): number[] {
   const resultLength = signal.length + kernel.length - 1
   const result = new Array(resultLength).fill(0)
 
   for (let i = 0; i < signal.length; i++) {
+    const s = signal[i]
+    if (s === 0) continue
     for (let j = 0; j < kernel.length; j++) {
-      result[i + j] += signal[i] * kernel[j]
+      result[i + j] += s * kernel[j]
     }
   }
 
   return result
 }
 
+/** 原地迭代 radix-2 FFT，re/im 长度须为 2 的幂 */
+function fft(re: Float64Array, im: Float64Array): void {
+  const n = re.length
+  for (let i = 1, j = 0; i < n; i++) {
+    let bit = n >> 1
+    for (; j & bit; bit >>= 1) j ^= bit
+    j ^= bit
+    if (i < j) {
+      ;[re[i], re[j]] = [re[j], re[i]]
+      ;[im[i], im[j]] = [im[j], im[i]]
+    }
+  }
+  for (let len = 2; len <= n; len <<= 1) {
+    const ang = (-2 * Math.PI) / len
+    const wr = Math.cos(ang)
+    const wi = Math.sin(ang)
+    for (let i = 0; i < n; i += len) {
+      let cr = 1
+      let ci = 0
+      for (let k = 0; k < len / 2; k++) {
+        const a = i + k
+        const b = a + len / 2
+        const xr = re[b] * cr - im[b] * ci
+        const xi = re[b] * ci + im[b] * cr
+        re[b] = re[a] - xr
+        im[b] = im[a] - xi
+        re[a] += xr
+        im[a] += xi
+        const nr = cr * wr - ci * wi
+        ci = cr * wi + ci * wr
+        cr = nr
+      }
+    }
+  }
+}
+
 /**
- * Calculate amplitude spectrum using DFT
+ * Calculate amplitude spectrum (FFT)
+ * 补零到至少 minLength 点（2 的幂）以细化频率采样；幅值按原始长度归一化，取 0 到奈奎斯特频率
  */
-export function calculateSpectrum(signal: number[], dt: number): { frequencies: number[]; amplitudes: number[] } {
+export function calculateSpectrum(
+  signal: number[],
+  dt: number,
+  minLength = 4096,
+): { frequencies: number[]; amplitudes: number[] } {
   const n = signal.length
+  let nfft = 1
+  while (nfft < Math.max(n, minLength)) nfft <<= 1
+
+  const re = new Float64Array(nfft)
+  const im = new Float64Array(nfft)
+  re.set(signal)
+  fft(re, im)
+
+  const df = 1 / (nfft * dt)
   const frequencies: number[] = []
   const amplitudes: number[] = []
-
-  // Calculate frequency resolution
-  const df = 1 / (n * dt)
-
-  // Only compute positive frequencies (up to Nyquist)
-  const numFreqs = Math.floor(n / 2)
-
-  for (let k = 0; k < numFreqs; k++) {
-    let real = 0
-    let imag = 0
-
-    for (let t = 0; t < n; t++) {
-      const angle = (2 * Math.PI * k * t) / n
-      real += signal[t] * Math.cos(angle)
-      imag -= signal[t] * Math.sin(angle)
-    }
-
+  for (let k = 0; k <= nfft / 2; k++) {
     frequencies.push(k * df)
-    amplitudes.push(Math.sqrt(real * real + imag * imag) / n)
+    amplitudes.push(Math.hypot(re[k], im[k]) / n)
   }
 
   return { frequencies, amplitudes }
+}
+
+/** 数组最大值（不用展开运算符，避免大数组超出函数参数上限） */
+export function maxOf(values: number[]): number {
+  let m = -Infinity
+  for (const v of values) if (v > m) m = v
+  return m
+}
+
+/** 数组最小值 */
+export function minOf(values: number[]): number {
+  let m = Infinity
+  for (const v of values) if (v < m) m = v
+  return m
+}
+
+/** 数组绝对值最大值 */
+export function maxAbsOf(values: number[]): number {
+  let m = 0
+  for (const v of values) {
+    const a = Math.abs(v)
+    if (a > m) m = a
+  }
+  return m
 }
 
 /**
